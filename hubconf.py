@@ -1,21 +1,13 @@
-from argparse import Namespace
-import math
-import time
-import dill as pickle
-from tqdm import tqdm
-
-import torch
-import torch.nn.functional as F
-import torch.optim as optim
-from torchtext.data import Field, Dataset, BucketIterator
-from torchtext.datasets import TranslationDataset
-
-import transformer.Constants as Constants
-from transformer.Models import Transformer
-from transformer.Optim import ScheduledOptim
-from train import prepare_dataloaders, cal_performance, patch_src, patch_trg
-import random
 import numpy as np
+import random
+import torch
+
+from apex import amp
+from maskrcnn_benchmark.modeling.detector import build_detection_model
+from maskrcnn_benchmark.config import cfg
+from maskrcnn_benchmark.data import make_data_loader
+from maskrcnn_benchmark.solver import make_lr_scheduler
+from maskrcnn_benchmark.solver import make_optimizer
 
 torch.manual_seed(1337)
 random.seed(1337)
@@ -23,62 +15,42 @@ np.random.seed(1337)
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 
+
 class Model:
     def __init__(self, device=None, jit=False):
-        self.device = device
+        self.device = cfg.MODEL.DEVICE = device
         self.jit = jit
-        self.opt = Namespace(**{
-            'batch_size': 128,
-            'd_inner_hid': 2048,
-            'd_k': 64,
-            'd_model': 512,
-            'd_word_vec': 512,
-            'd_v': 64,
-            'data_pkl': 'm30k_deen_shr.pkl',
-            'debug': '',
-            'dropout': 0.1,
-            'embs_share_weight': False,
-            'epoch': 1,
-            'label_smoothing': False,
-            'log': None,
-            'n_head': 8,
-            'n_layers': 6,
-            'n_warmup_steps': 128,
-            'cuda': True,
-            'proj_share_weight': False,
-            'save_mode': 'best',
-            'save_model': None,
-            'script': False,
-            'train_path': None,
-            'val_path': None,
-        })
-
-        _, validation_data = prepare_dataloaders(self.opt, self.device)
-        transformer = Transformer(
-            self.opt.src_vocab_size,
-            self.opt.trg_vocab_size,
-            src_pad_idx=self.opt.src_pad_idx,
-            trg_pad_idx=self.opt.trg_pad_idx,
-            trg_emb_prj_weight_sharing=self.opt.proj_share_weight,
-            emb_src_trg_weight_sharing=self.opt.embs_share_weight,
-            d_k=self.opt.d_k,
-            d_v=self.opt.d_v,
-            d_model=self.opt.d_model,
-            d_word_vec=self.opt.d_word_vec,
-            d_inner=self.opt.d_inner_hid,
-            n_layers=self.opt.n_layers,
-            n_head=self.opt.n_head,
-            dropout=self.opt.dropout).to(self.device)
-
+        cfg.merge_from_file('configs/e2e_mask_rcnn_R_50_FPN_1x.yaml')
+        # cfg.merge_from_list('SOLVER.IMS_PER_BATCH 2 SOLVER.BASE_LR 0.0025 SOLVER.MAX_ITER 720000 SOLVER.STEPS "(480000, 640000)" TEST.IMS_PER_BATCH 1 MODEL.RPN.FPN_POST_NMS_TOP_N_TRAIN 2000')
+        self.module = build_detection_model(cfg)
+        start_iter = 0
+        is_distributed = False
+ 
         if self.jit:
-            transformer = torch.jit.script(transformer)
-        self.module = transformer
+            self.module = torch.jit.script(self.module)
 
-        batch = list(validation_data)[0]
-        src_seq = patch_src(batch.src, self.opt.src_pad_idx).to(self.device)
-        trg_seq, self.gold = map(lambda x: x.to(self.device), patch_trg(batch.trg, self.opt.trg_pad_idx))
-        # We use validation_data for training as well so that it can finish fast enough.
-        self.example_inputs = (src_seq, trg_seq)
+        self.module.to(device)
+
+        self.optimizer = make_optimizer(cfg, self.module)
+        self.scheduler = make_lr_scheduler(cfg, self.optimizer)
+        # Initialize mixed-precision training
+        use_mixed_precision = cfg.DTYPE == "float16"
+        amp_opt_level = 'O1' if use_mixed_precision else 'O0'
+        self.module, self.optimizer = amp.initialize(
+            self.module, self.optimizer,
+            opt_level=amp_opt_level)
+
+        data_loader = make_data_loader(
+            cfg,
+            is_train=True,
+            is_distributed=is_distributed,
+            start_iter=start_iter,
+        )
+
+        images, targets, _ = next(iter(data_loader))
+        images = images.to(device)
+        targets = [target.to(device) for target in targets]
+        self.example_inputs = (images, targets)
 
     def get_module(self):
         return self.module, self.example_inputs
@@ -89,17 +61,18 @@ class Model:
             self.module(*self.example_inputs)
 
     def train(self, niter=1):
-        optimizer = ScheduledOptim(
-            optim.Adam(self.module.parameters(), betas=(0.9, 0.98), eps=1e-09),
-            2.0, self.opt.d_model, self.opt.n_warmup_steps)
+        self.module.train()
         for _ in range(niter):
-            optimizer.zero_grad()
-            pred = self.module(*self.example_inputs)
+            loss_dict = self.module(*self.example_inputs)
+            losses = sum(loss for loss in loss_dict.values())
+            self.optimizer.zero_grad()
 
-            loss, n_correct, n_word = cal_performance(
-                pred, self.gold, self.opt.trg_pad_idx, smoothing=self.opt.label_smoothing)
-            loss.backward()
-            optimizer.step_and_update_lr()
+            # Note: If mixed precision is not used, this ends up doing nothing
+            # Otherwise apply loss scaling for mixed-precision recipe
+            with amp.scale_loss(losses, self.optimizer) as scaled_losses:
+                scaled_losses.backward()
+            self.optimizer.step()
+            self.scheduler.step()
 
 
 if __name__ == '__main__':
@@ -107,9 +80,4 @@ if __name__ == '__main__':
     module, example_inputs = m.get_module()
     module(*example_inputs)
     m.train(niter=1)
-    with torch.autograd.profiler.profile() as prof:
-        with torch.autograd.profiler.record_function('train'):
-            m.train(niter=1)
-        with torch.autograd.profiler.record_function('eval'):
-            m.eval(niter=1)
-    prof.export_chrome_trace("trace.json")
+    m.eval(niter=1)
